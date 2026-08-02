@@ -74,6 +74,7 @@ KEY_DIR="${WG_DIR}/keys"
 sudo mkdir -p "${KEY_DIR}"
 sudo chmod 700 "${KEY_DIR}"
 
+
 # ---------------------------------------------------------
 # KEY GENERIERUNG & REGISTRIERUNG
 # ---------------------------------------------------------
@@ -85,7 +86,9 @@ if [ ! -f "${KEY_DIR}/private.key" ]; then
   
   echo "${PRIV_KEY}" | sudo tee "${KEY_DIR}/private.key" > /dev/null
   echo "${PUB_KEY}" | sudo tee "${KEY_DIR}/public.key" > /dev/null
-  sudo chmod 600 "${KEY_DIR}"/*
+  
+  # Sauberer Rechte-Setzen ohne Wildcard-Fehler auf macOS
+  sudo chmod 600 "${KEY_DIR}/private.key" "${KEY_DIR}/public.key"
 fi
 
 CLIENT_PRIV=$(sudo cat "${KEY_DIR}/private.key")
