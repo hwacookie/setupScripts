@@ -7,22 +7,48 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Variablen aus Argumenten $1 / $2 ODER Umgebungsvariablen ODER Default auslesen
-SERVER_ENDPOINT="${1:-${SERVER_ENDPOINT:-u7kbhjk38mjye00o.myfritz.net}}"
-API_TOKEN="${2:-${API_TOKEN:-}}"
-API_PORT="8050"
+# Standard-Endpoint definieren
+DEFAULT_ENDPOINT="u7kbhjk38mjye00o.myfritz.net"
 
+# ---------------------------------------------------------
+# INTERAKTIVE ODER ENV-BASIERTE ABFRAGE
+# ---------------------------------------------------------
+
+# Server Endpoint ermitteln ($1 Argument -> $SERVER_ENDPOINT Env -> Default)
+SERVER_ENDPOINT="${1:-${SERVER_ENDPOINT:-}}"
+if [ -z "${SERVER_ENDPOINT}" ]; then
+  # Interaktiv nachfragen, wenn Terminal vorhanden
+  if [ -t 0 ]; then
+    read -p "Server Endpoint/DynDNS [Default: ${DEFAULT_ENDPOINT}]: " INPUT_ENDPOINT
+    SERVER_ENDPOINT="${INPUT_ENDPOINT:-${DEFAULT_ENDPOINT}}"
+  else
+    SERVER_ENDPOINT="${DEFAULT_ENDPOINT}"
+  fi
+fi
+
+# API Token ermitteln ($2 Argument -> $API_TOKEN Env -> Interaktiv)
+API_TOKEN="${2:-${API_TOKEN:-}}"
 if [ -z "${API_TOKEN}" ]; then
-  echo "Fehler: API_TOKEN ist nicht gesetzt!"
-  echo ""
-  echo "Aufruf-Möglichkeiten:"
-  echo "  1) sudo ./setup_client.sh <ENDPOINT> <API_TOKEN>"
-  echo "     Beispiel: sudo ./setup_client.sh u7kbhjk38mjye00o.myfritz.net MEIN_TOKEN"
-  echo ""
-  echo "  2) Als Umgebungsvariable:"
-  echo "     sudo API_TOKEN=\"MEIN_TOKEN\" ./setup_client.sh"
+  # Interaktiv nachfragen (Eingabe maskiert mit read -s)
+  if [ -t 0 ]; then
+    echo -n "API Token eingeben: "
+    read -s API_TOKEN
+    echo ""
+  fi
+fi
+
+# Prüfen, ob wir jetzt ein Token haben
+if [ -z "${API_TOKEN}" ]; then
+  echo "Fehler: API_TOKEN ist nicht gesetzt und konnte nicht erfragt werden!"
+  echo "Nutzung: sudo API_TOKEN=\"...\" ./setup_client.sh"
   exit 1
 fi
+
+API_PORT="8050"
+
+# ---------------------------------------------------------
+# SETUP & REGISTRIERUNG
+# ---------------------------------------------------------
 
 # 2. WireGuard & Tools installieren
 if ! command -v wg &> /dev/null; then
@@ -45,7 +71,7 @@ CLIENT_PRIV=$(cat "${KEY_DIR}/private.key")
 CLIENT_PUB=$(cat "${KEY_DIR}/public.key")
 
 # 4. Registrieren
-echo "--> Registriere Client beim Server (${SERVER_ENDPOINT}:${API_PORT})..."
+echo "--> Registriere Client bei ${SERVER_ENDPOINT}:${API_PORT}..."
 RESPONSE=$(curl -s -X POST "http://${SERVER_ENDPOINT}:${API_PORT}/register" \
   -H "X-API-Token: ${API_TOKEN}" \
   -H "Content-Type: application/json" \
