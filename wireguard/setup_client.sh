@@ -5,19 +5,35 @@ set -euo pipefail
 DEFAULT_ENDPOINT="u7kbhjk38mjye00o.myfritz.net"
 API_PORT="8050"
 
+# ---------------------------------------------------------
+# FEHLER-HANDLING / HELPER
+# ---------------------------------------------------------
+
+error_exit() {
+  echo ""
+  echo "=================================================="
+  echo " FEHLER: $1"
+  echo "=================================================="
+  if [ -n "${2:-}" ]; then
+    echo "Mögliche Ursachen & Lösungsschritte:"
+    echo "$2"
+  fi
+  echo "=================================================="
+  exit 1
+}
+
 # 1. OS-Erkennung (macOS vs. Linux)
 OS_TYPE="$(uname -s)"
 
 if [ "${OS_TYPE}" = "Linux" ]; then
   if [ "$EUID" -ne 0 ]; then
-    echo "Fehler: Auf Linux bitte das Skript mit 'sudo' ausführen!"
-    exit 1
+    error_exit "Dieses Skript muss auf Linux mit 'sudo' ausgeführt werden!" \
+               "  -> Aufruf: sudo ./setup_client.sh"
   fi
 elif [ "${OS_TYPE}" = "Darwin" ]; then
   echo "--> macOS erkannt."
 else
-  echo "Fehler: Nicht unterstütztes Betriebssystem: ${OS_TYPE}"
-  exit 1
+  error_exit "Nicht unterstütztes Betriebssystem: ${OS_TYPE}"
 fi
 
 # ---------------------------------------------------------
@@ -44,8 +60,8 @@ if [ -z "${API_TOKEN}" ]; then
 fi
 
 if [ -z "${API_TOKEN}" ]; then
-  echo "Fehler: API_TOKEN ist nicht gesetzt!"
-  exit 1
+  error_exit "API_TOKEN ist nicht gesetzt!" \
+             "  1) Interaktiv eingeben beim Starten\n  2) Als Variable übergeben: sudo API_TOKEN=\"...\" ./setup_client.sh"
 fi
 
 # ---------------------------------------------------------
@@ -53,18 +69,18 @@ fi
 # ---------------------------------------------------------
 
 if [ "${OS_TYPE}" = "Linux" ]; then
-  if ! command -v wg &> /dev/null; then
+  if ! command -v wg &> /dev/null || ! command -v jq &> /dev/null; then
     echo "--> Installiere WireGuard & Tools via apt..."
-    apt-get update && apt-get install -y wireguard wireguard-tools curl jq ufw
+    apt-get update -qq && apt-get install -y -qq wireguard wireguard-tools curl jq ufw || \
+      error_exit "Paketinstallation über apt-get fehlgeschlagen." "Prüfe deine Internetverbindung auf dem Client."
   fi
   WG_DIR="/etc/wireguard"
 elif [ "${OS_TYPE}" = "Darwin" ]; then
   if ! command -v wg &> /dev/null || ! command -v jq &> /dev/null; then
     echo "--> Installiere wireguard-tools & jq via Homebrew..."
-    brew install wireguard-tools jq curl
+    brew install wireguard-tools jq curl || \
+      error_exit "Homebrew-Installation fehlgeschlagen." "Stelle sicher, dass Homebrew auf deinem Mac installiert ist."
   fi
-  
-  # Pfad für Homebrew WireGuard-Configs (Intel vs Apple Silicon)
   BREW_PREFIX="$(brew --prefix)"
   WG_DIR="${BREW_PREFIX}/etc/wireguard"
   sudo mkdir -p "${WG_DIR}"
@@ -92,18 +108,39 @@ CLIENT_PRIV=$(sudo cat "${KEY_DIR}/private.key")
 CLIENT_PUB=$(sudo cat "${KEY_DIR}/public.key")
 
 echo "--> Registriere Client bei ${SERVER_ENDPOINT}:${API_PORT}..."
-RESPONSE=$(curl -s -X POST "http://${SERVER_ENDPOINT}:${API_PORT}/register" \
+
+# HTTP Statuscode & Response getrennt auslesen, Timeout auf 5 Sekunden
+HTTP_STATUS=$(curl -s -o /tmp/wg_api_res.txt -w "%{http_code}" --connect-timeout 5 \
+  -X POST "http://${SERVER_ENDPOINT}:${API_PORT}/register" \
   -H "X-API-Token: ${API_TOKEN}" \
   -H "Content-Type: application/json" \
-  -d "{\"pubkey\": \"${CLIENT_PUB}\"}")
+  -d "{\"pubkey\": \"${CLIENT_PUB}\"}" || echo "000")
+
+RESPONSE=$(cat /tmp/wg_api_res.txt 2>/dev/null || echo "")
+
+# ---------------------------------------------------------
+# HTTP RESPONSE PRÜFEN
+# ---------------------------------------------------------
+
+if [ "${HTTP_STATUS}" = "000" ]; then
+  error_exit "Verbindung zum Server '${SERVER_ENDPOINT}:${API_PORT}' fehlgeschlagen (Timeout/Refused)!" \
+             "  1. Ist Port 8050 TCP in der Fritz!Box freigegeben?\n  2. Läuft der API-Dienst auf home-gateway? (sudo systemctl status wg-api)\n  3. Teste Erreichbarkeit im Mac-Terminal: nc -zv ${SERVER_ENDPOINT} 8050"
+
+elif [ "${HTTP_STATUS}" = "401" ]; then
+  error_exit "401 Unauthorized - Ungültiges API-Token!" \
+             "  Das angegebene API-Token stimmt nicht mit der Datei /etc/wireguard/keys/api_token.txt auf dem Server überein."
+
+elif [ "${HTTP_STATUS}" -ne 200 ]; then
+  error_exit "Server meldet Fehler (HTTP Status ${HTTP_STATUS})!" \
+             "  Antwort vom Server: ${RESPONSE}"
+fi
 
 ASSIGNED_IP=$(echo "${RESPONSE}" | jq -r '.ip // empty')
 SERVER_PUBKEY=$(echo "${RESPONSE}" | jq -r '.server_pubkey // empty')
 
-if [ -z "${ASSIGNED_IP}" ]; then
-  echo "Fehler bei der Registrierung am Server! Antwort war:"
-  echo "${RESPONSE}"
-  exit 1
+if [ -z "${ASSIGNED_IP}" ] || [ -z "${SERVER_PUBKEY}" ]; then
+  error_exit "Server-Antwort war unvollständig oder ungültig!" \
+             "  Rohdaten der Antwort: ${RESPONSE}"
 fi
 
 echo "--> Vom Server zugewiesene VPN-IP: ${ASSIGNED_IP}"
@@ -130,7 +167,7 @@ sudo chmod 600 "${CONF_FILE}"
 
 if [ "${OS_TYPE}" = "Linux" ]; then
   echo "--> Starte WireGuard Service (systemd)..."
-  systemctl enable --now wg-quick@wg0
+  systemctl enable --now wg-quick@wg0 || error_exit "Konnte wg-quick@wg0 nicht starten."
 
   # Firewall auf Linux
   ufw default deny incoming 2>/dev/null || true
@@ -142,7 +179,7 @@ if [ "${OS_TYPE}" = "Linux" ]; then
 elif [ "${OS_TYPE}" = "Darwin" ]; then
   echo "--> Starte WireGuard Tunnel auf macOS..."
   sudo wg-quick down wg0 2>/dev/null || true
-  sudo wg-quick up wg0
+  sudo wg-quick up wg0 || error_exit "Konnte WireGuard Tunnel auf macOS nicht aktivieren."
 fi
 
 echo "=================================================="
@@ -158,8 +195,8 @@ echo ""
 # ---------------------------------------------------------
 
 echo "--> Hole Liste aller registrierten VPN-Clients..."
-CLIENTS_RESPONSE=$(curl -s -X GET "http://${SERVER_ENDPOINT}:${API_PORT}/clients" \
-  -H "X-API-Token: ${API_TOKEN}")
+CLIENTS_RESPONSE=$(curl -s --connect-timeout 3 -X GET "http://${SERVER_ENDPOINT}:${API_PORT}/clients" \
+  -H "X-API-Token: ${API_TOKEN}" || echo "")
 
 if [ -n "${CLIENTS_RESPONSE}" ] && echo "${CLIENTS_RESPONSE}" | jq -e '.clients' >/dev/null 2>&1; then
   echo "=================================================="
@@ -174,5 +211,5 @@ if [ -n "${CLIENTS_RESPONSE}" ] && echo "${CLIENTS_RESPONSE}" | jq -e '.clients'
   done
   echo "=================================================="
 else
-  echo "(Konnte Client-Liste vom Server nicht abrufen)"
+  echo "(Hinweis: Client-Liste konnte nach dem Verbinden nicht abgerufen werden)"
 fi
