@@ -15,8 +15,9 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=== 1. Installiere System-Pakete ==="
-apt-get update -qq && apt-get install -y -qq wireguard wireguard-tools ufw iptables python3 curl jq || \
-  error_exit "Apt-Paketinstallation fehlgeschlagen. Prüfe die Paketquellen/Internetverbindung."
+apt-get update -qq && apt-get install -y -qq wireguard wireguard-tools ufw iptables python3 curl jq python3-requests 2>/dev/null || \
+  apt-get install -y -qq wireguard wireguard-tools ufw iptables python3 curl jq || \
+  error_exit "Apt-Paketinstallation fehlgeschlagen."
 
 KEY_DIR="/etc/wireguard/keys"
 mkdir -p "${KEY_DIR}"
@@ -35,42 +36,107 @@ if [ ! -f "${KEY_DIR}/api_token.txt" ]; then
 fi
 
 # ---------------------------------------------------------
-# PI-HOLE v6 REST API KONFIGURATION (INTERAKTIVE ABFRAGE)
+# PI-HOLE v6 REST API KONFIGURATION (AUTOMATISCH & INTERAKTIV)
 # ---------------------------------------------------------
 echo "=== 3. Pi-hole v6 REST API Integration setup ==="
 
 PIHOLE_URL_FILE="${KEY_DIR}/pihole_url.txt"
 PIHOLE_TOKEN_FILE="${KEY_DIR}/pihole_token.txt"
 
-# Pi-hole URL abfragen, falls nicht vorhanden
-if [ ! -f "${PIHOLE_URL_FILE}" ]; then
-  INPUT_URL="${PIHOLE_URL:-}"
-  if [ -z "${INPUT_URL}" ] && [ -t 0 ]; then
-    read -p "Pi-hole Server URL/IP (z.B. http://192.168.178.10 oder http://ha-prime): " INPUT_URL
-  fi
-  if [ -n "${INPUT_URL}" ]; then
-    echo "${INPUT_URL}" > "${PIHOLE_URL_FILE}"
-  else
-    echo " (Hinweis: Keine Pi-hole URL angegeben. DNS-Registrierung wird deaktiviert)."
-  fi
+# Automatisch den aktuellen System-DNS-Server des Home-Gateways ermitteln
+AUTO_DNS_IP=""
+if command -v resolvectl &> /dev/null; then
+  AUTO_DNS_IP=$(resolvectl status 2>/dev/null | awk '/Current DNS Server/ {print $NF; exit}')
+fi
+if [ -z "${AUTO_DNS_IP}" ] && [ -f /etc/resolv.conf ]; then
+  AUTO_DNS_IP=$(awk '/nameserver/ {print $2; exit}' /etc/resolv.conf)
 fi
 
-# Pi-hole Passwort abfragen, falls nicht vorhanden
-if [ -f "${PIHOLE_URL_FILE}" ] && [ ! -f "${PIHOLE_TOKEN_FILE}" ]; then
-  INPUT_PASS="${PIHOLE_PASSWORD:-}"
-  if [ -z "${INPUT_PASS}" ] && [ -t 0 ]; then
-    echo -n "Pi-hole Web-Passwort/API-Token eingeben: "
-    read -s INPUT_PASS
-    echo ""
-  fi
-  if [ -n "${INPUT_PASS}" ]; then
-    echo "${INPUT_PASS}" > "${PIHOLE_TOKEN_FILE}"
-  else
-    echo " (Hinweis: Kein Passwort angegeben. DNS-Registrierung wird deaktiviert)."
-  fi
-fi
+DEFAULT_PIHOLE_URL="${AUTO_DNS_IP:+http://${AUTO_DNS_IP}}"
+DEFAULT_PIHOLE_URL="${DEFAULT_PIHOLE_URL:-http://192.168.188.204}"
 
-chmod 600 "${KEY_DIR}"/*
+# Schleife, bis Pi-hole erfolgreich verifiziert wurde (oder übersprungen wird)
+while true; do
+  # URL ermitteln / abfragen
+  if [ -f "${PIHOLE_URL_FILE}" ]; then
+    CONFIGURED_URL=$(cat "${PIHOLE_URL_FILE}")
+  else
+    INPUT_URL="${PIHOLE_URL:-}"
+    if [ -z "${INPUT_URL}" ] && [ -t 0 ]; then
+      read -p "Pi-hole Server URL/IP [Default: ${DEFAULT_PIHOLE_URL}]: " INPUT_URL
+      INPUT_URL="${INPUT_URL:-${DEFAULT_PIHOLE_URL}}"
+    else
+      INPUT_URL="${DEFAULT_PIHOLE_URL}"
+    fi
+    CONFIGURED_URL="${INPUT_URL}"
+  fi
+
+  # Passwort ermitteln / abfragen
+  if [ -f "${PIHOLE_TOKEN_FILE}" ]; then
+    CONFIGURED_PASS=$(cat "${PIHOLE_TOKEN_FILE}")
+  else
+    INPUT_PASS="${PIHOLE_PASSWORD:-}"
+    if [ -z "${INPUT_PASS}" ] && [ -t 0 ]; then
+      echo -n "Pi-hole Web-Passwort/API-Token eingeben: "
+      read -s INPUT_PASS
+      echo ""
+    fi
+    CONFIGURED_PASS="${INPUT_PASS}"
+  fi
+
+  # Wenn gar nichts eingegeben wurde, abbrechen/überspringen
+  if [ -z "${CONFIGURED_URL}" ] || [ -z "${CONFIGURED_PASS}" ]; then
+    echo " (Hinweis: Pi-hole Integration übersprungen)."
+    rm -f "${PIHOLE_URL_FILE}" "${PIHOLE_TOKEN_FILE}"
+    break
+  fi
+
+  echo "--> Teste Verbindung und Authentifizierung mit Pi-hole unter ${CONFIGURED_URL}..."
+
+  # Test-Skript in Python ausführen, um das Pi-hole zu verifizieren
+  VERIFY_RESULT=$(python3 -c '
+import urllib.request
+import json
+import sys
+
+url = sys.argv[1].rstrip("/") + "/api/auth"
+password = sys.argv[2]
+
+try:
+    data = json.dumps({"password": password}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=3) as res:
+        resp = json.loads(res.read().decode())
+        if "session" in resp and "sid" in resp["session"]:
+            print("OK")
+        else:
+            print("INVALID_AUTH")
+except Exception as e:
+    print(f"ERROR: {e}")
+' "${CONFIGURED_URL}" "${CONFIGURED_PASS}")
+
+  if [ "${VERIFY_RESULT}" = "OK" ]; then
+    echo "--> Pi-hole erfolgreich verifiziert!"
+    echo "${CONFIGURED_URL}" > "${PIHOLE_URL_FILE}"
+    echo "${CONFIGURED_PASS}" > "${PIHOLE_TOKEN_FILE}"
+    break
+  else
+    echo "❌ FEHLER: Konnte kein gültiges Pi-hole unter ${CONFIGURED_URL} erreichen oder Passwort ist falsch."
+    echo "   Details: ${VERIFY_RESULT}"
+    rm -f "${PIHOLE_URL_FILE}" "${PIHOLE_TOKEN_FILE}"
+    
+    if [ -t 0 ]; then
+      read -p "Möchtest du es noch einmal versuchen? (j/n): " RETRY
+      if [[ "${RETRY}" =~ ^([jJ][aA]|[jJ])$ ]]; then
+        continue
+      fi
+    fi
+    echo " (Überspringe Pi-hole Integration für diesen Durchlauf)."
+    break
+  fi
+done
+
+chmod 600 "${KEY_DIR}"/* 2>/dev/null || true
 
 SERVER_PRIV=$(cat "${KEY_DIR}/server_private.key")
 SERVER_PUB=$(cat "${KEY_DIR}/server_public.key")
@@ -128,7 +194,6 @@ def sync_wireguard():
 # ---------------------------------------------------------
 
 def pihole_v6_auth(base_url, password):
-    """Authentifiziert sich an der Pi-hole v6 API und liefert eine Session-ID (sid)."""
     try:
         url = f"{base_url.rstrip('/')}/api/auth"
         data = json.dumps({"password": password}).encode("utf-8")
@@ -141,7 +206,6 @@ def pihole_v6_auth(base_url, password):
         return None
 
 def pihole_add_dns_v6(ip, hostname):
-    """Fügt Custom DNS über Pi-hole v6 REST API hinzu."""
     base_url = read_file_strip(PIHOLE_URL_FILE)
     password = read_file_strip(PIHOLE_TOKEN_FILE)
     if not base_url or not password:
@@ -166,7 +230,6 @@ def pihole_add_dns_v6(ip, hostname):
         print(f"[Pi-hole API Add Error]: {e}")
 
 def pihole_remove_dns_v6(ip):
-    """Entfernt Custom DNS über Pi-hole v6 REST API."""
     base_url = read_file_strip(PIHOLE_URL_FILE)
     password = read_file_strip(PIHOLE_TOKEN_FILE)
     if not base_url or not password:
@@ -276,7 +339,6 @@ class RegisterHandler(http.server.BaseHTTPRequestHandler):
 
                     sync_wireguard()
 
-                # Per REST API an Pi-hole senden
                 if hostname and assigned_ip:
                     pihole_add_dns_v6(assigned_ip, hostname)
 
@@ -328,7 +390,6 @@ class RegisterHandler(http.server.BaseHTTPRequestHandler):
 
                     sync_wireguard()
 
-                    # Per REST API aus Pi-hole löschen
                     if removed_ip:
                         pihole_remove_dns_v6(removed_ip)
 
