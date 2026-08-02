@@ -1,13 +1,5 @@
 #!/bin/bash
-set -e
-
-# =========================================================
-# KONFIGURATION (Hier deine Server-Daten eintragen):
-# =========================================================
-SERVER_ENDPOINT="u7kbhjk38mjye00o.myfritz.net"
-API_PORT="8050"
-API_TOKEN="<DEIN_API_TOKEN_VOM_SERVER>"
-# =========================================================
+set -euo pipefail
 
 # 1. Root-Check
 if [ "$EUID" -ne 0 ]; then
@@ -15,14 +7,26 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-if [ "${SERVER_ENDPOINT}" == "<DEINE_PUBLIC_IP_ODER_DYNDNS>" ] || [ "${API_TOKEN}" == "<DEIN_API_TOKEN_VOM_SERVER>" ]; then
-  echo "Fehler: Bitte trage zuerst deine SERVER_ENDPOINT und deinen API_TOKEN im Skript ein!"
+# Variablen aus Argumenten $1 / $2 ODER Umgebungsvariablen ODER Default auslesen
+SERVER_ENDPOINT="${1:-${SERVER_ENDPOINT:-u7kbhjk38mjye00o.myfritz.net}}"
+API_TOKEN="${2:-${API_TOKEN:-}}"
+API_PORT="8050"
+
+if [ -z "${API_TOKEN}" ]; then
+  echo "Fehler: API_TOKEN ist nicht gesetzt!"
+  echo ""
+  echo "Aufruf-Möglichkeiten:"
+  echo "  1) sudo ./setup_client.sh <ENDPOINT> <API_TOKEN>"
+  echo "     Beispiel: sudo ./setup_client.sh u7kbhjk38mjye00o.myfritz.net MEIN_TOKEN"
+  echo ""
+  echo "  2) Als Umgebungsvariable:"
+  echo "     sudo API_TOKEN=\"MEIN_TOKEN\" ./setup_client.sh"
   exit 1
 fi
 
 # 2. WireGuard & Tools installieren
 if ! command -v wg &> /dev/null; then
-  echo "--> Installiere WireGuard & Werkzeuge..."
+  echo "--> Installiere WireGuard & Tools..."
   apt-get update && apt-get install -y wireguard wireguard-tools curl jq ufw
 fi
 
@@ -30,7 +34,7 @@ KEY_DIR="/etc/wireguard/keys"
 mkdir -p "${KEY_DIR}"
 chmod 700 "${KEY_DIR}"
 
-# 3. Schlüsselpaar lokal erzeugen
+# 3. Client Key erzeugen
 if [ ! -f "${KEY_DIR}/private.key" ]; then
   echo "--> Generiere einzigartiges Schlüsselpaar für diesen Client..."
   wg genkey | tee "${KEY_DIR}/private.key" | wg pubkey > "${KEY_DIR}/public.key"
@@ -40,25 +44,25 @@ fi
 CLIENT_PRIV=$(cat "${KEY_DIR}/private.key")
 CLIENT_PUB=$(cat "${KEY_DIR}/public.key")
 
-# 4. Beim Server registrieren & IP abfragen
+# 4. Registrieren
 echo "--> Registriere Client beim Server (${SERVER_ENDPOINT}:${API_PORT})..."
 RESPONSE=$(curl -s -X POST "http://${SERVER_ENDPOINT}:${API_PORT}/register" \
   -H "X-API-Token: ${API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d "{\"pubkey\": \"${CLIENT_PUB}\"}")
 
-ASSIGNED_IP=$(echo "${RESPONSE}" | jq -r '.ip')
-SERVER_PUBKEY=$(echo "${RESPONSE}" | jq -r '.server_pubkey')
+ASSIGNED_IP=$(echo "${RESPONSE}" | jq -r '.ip // empty')
+SERVER_PUBKEY=$(echo "${RESPONSE}" | jq -r '.server_pubkey // empty')
 
-if [ -z "${ASSIGNED_IP}" ] || [ "${ASSIGNED_IP}" == "null" ]; then
-  echo "Fehler bei der Registrierung am Server! Antwort vom Server war:"
+if [ -z "${ASSIGNED_IP}" ]; then
+  echo "Fehler bei der Registrierung am Server! Antwort war:"
   echo "${RESPONSE}"
   exit 1
 fi
 
-echo "--> Vom Server zugewiesene VPN-IP: ${ASSIGNED_IP}"
+echo "--> Zugewiesene VPN-IP: ${ASSIGNED_IP}"
 
-# 5. Local wg0.conf erstellen
+# 5. Local wg0.conf schreiben
 cat << EOF > /etc/wireguard/wg0.conf
 [Interface]
 PrivateKey = ${CLIENT_PRIV}
@@ -73,10 +77,10 @@ EOF
 
 chmod 600 /etc/wireguard/wg0.conf
 
-# 6. Service aktivieren & starten
+# 6. Service starten
 systemctl enable --now wg-quick@wg0
 
-# 7. Local Firewall konfigurieren
+# 7. Local Firewall
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow 22/tcp

@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # 1. Root-Check
 if [ "$EUID" -ne 0 ]; then
@@ -14,20 +14,24 @@ KEY_DIR="/etc/wireguard/keys"
 mkdir -p "${KEY_DIR}"
 chmod 700 "${KEY_DIR}"
 
-# 2. Server Keys & API Token generieren
+# 2. Server Keys & API Token generieren (falls noch nicht vorhanden)
 echo "=== 2. Generiere Server-Schlüssel & API-Token ==="
 if [ ! -f "${KEY_DIR}/server_private.key" ]; then
   wg genkey | tee "${KEY_DIR}/server_private.key" | wg pubkey > "${KEY_DIR}/server_public.key"
-  head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 24 > "${KEY_DIR}/api_token.txt"
-  chmod 600 "${KEY_DIR}"/*
 fi
+
+if [ ! -f "${KEY_DIR}/api_token.txt" ]; then
+  head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 24 > "${KEY_DIR}/api_token.txt"
+fi
+
+chmod 600 "${KEY_DIR}"/*
 
 SERVER_PRIV=$(cat "${KEY_DIR}/server_private.key")
 SERVER_PUB=$(cat "${KEY_DIR}/server_public.key")
 API_TOKEN=$(cat "${KEY_DIR}/api_token.txt")
 DEFAULT_IFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
 
-# 3. /etc/wireguard/wg0.conf Grundgerüst erstellen
+# 3. Server wg0.conf Grundgerüst
 echo "=== 3. Erstelle Server WireGuard-Konfiguration ==="
 cat << EOF > /etc/wireguard/wg0.conf
 [Interface]
@@ -44,9 +48,9 @@ sysctl -p /etc/sysctl.d/99-wireguard.conf || true
 
 systemctl enable --now wg-quick@wg0
 
-# 4. Registrierungs-API in Python schreiben
+# 4. API-Server Python-Datei erstellen
 echo "=== 4. Erstelle API-Dienst (/usr/local/bin/wg_register_api.py) ==="
-cat << 'EOF' > /usr/local/bin/wg_register_api.py
+cat << 'PYEOF' > /usr/local/bin/wg_register_api.py
 import http.server
 import json
 import subprocess
@@ -54,8 +58,9 @@ import subprocess
 API_TOKEN_FILE = "/etc/wireguard/keys/api_token.txt"
 WG_CONF = "/etc/wireguard/wg0.conf"
 
-with open(API_TOKEN_FILE) as f:
-    VALID_TOKEN = f.read().strip()
+def get_valid_token():
+    with open(API_TOKEN_FILE) as f:
+        return f.read().strip()
 
 def sync_wireguard():
     cmd = "wg-quick strip wg0 > /tmp/wg_stripped.conf && wg syncconf wg0 /tmp/wg_stripped.conf"
@@ -64,7 +69,7 @@ def sync_wireguard():
 class RegisterHandler(http.server.BaseHTTPRequestHandler):
     def check_auth(self):
         token = self.headers.get("X-API-Token")
-        if token != VALID_TOKEN:
+        if token != get_valid_token():
             self.send_response(401)
             self.end_headers()
             return False
@@ -195,10 +200,10 @@ class RegisterHandler(http.server.BaseHTTPRequestHandler):
 if __name__ == "__main__":
     server = http.server.HTTPServer(("0.0.0.0", 8050), RegisterHandler)
     server.serve_forever()
-EOF
+PYEOF
 
-# 5. Systemd Service für die API anlegen
-echo "=== 5. Richtete Systemd Service ein ==="
+# 5. Systemd Service einrichten
+echo "=== 5. Richte Systemd Service ein ==="
 cat << EOF > /etc/systemd/system/wg-api.service
 [Unit]
 Description=WireGuard Dynamic Registration API
@@ -215,25 +220,22 @@ EOF
 systemctl daemon-reload
 systemctl enable --now wg-api
 
-# 6. Firewall auf Server konfigurieren
-echo "=== 6. Konfiguriere Firewall (UFW) ==="
+# 6. Firewall einrichten
+echo "=== 6. Firewall konfigurieren (UFW) ==="
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow 22/tcp        # SSH
-ufw allow 51820/udp     # WireGuard VPN Port
-ufw allow 8050/tcp      # Registrierungs-API Port
-ufw allow in on wg0     # VPN Internal Traffic
+ufw allow 22/tcp
+ufw allow 51820/udp
+ufw allow 8050/tcp
+ufw allow in on wg0
 ufw --force enable
 
 PUBLIC_IP=$(curl -s ifconfig.me || curl -s api.ipify.org)
 
 echo "=================================================="
-echo " SERVER SETUP ERFOLGREICH ABGESCHLOSSEN!"
+echo " SERVER SETUP ABGESCHLOSSEN!"
 echo "=================================================="
 echo " Public IP / Endpoint: ${PUBLIC_IP}"
 echo " API Port:             8050"
 echo " Deines API-Token:      ${API_TOKEN}"
-echo ""
-echo " WICHTIG: Trage ${API_TOKEN} und deine Public IP/DynDNS"
-echo " im Client-Skript ein!"
 echo "=================================================="
