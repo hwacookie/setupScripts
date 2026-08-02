@@ -74,7 +74,6 @@ KEY_DIR="${WG_DIR}/keys"
 sudo mkdir -p "${KEY_DIR}"
 sudo chmod 700 "${KEY_DIR}"
 
-
 # ---------------------------------------------------------
 # KEY GENERIERUNG & REGISTRIERUNG
 # ---------------------------------------------------------
@@ -86,8 +85,6 @@ if [ ! -f "${KEY_DIR}/private.key" ]; then
   
   echo "${PRIV_KEY}" | sudo tee "${KEY_DIR}/private.key" > /dev/null
   echo "${PUB_KEY}" | sudo tee "${KEY_DIR}/public.key" > /dev/null
-  
-  # Sauberer Rechte-Setzen ohne Wildcard-Fehler auf macOS
   sudo chmod 600 "${KEY_DIR}/private.key" "${KEY_DIR}/public.key"
 fi
 
@@ -136,15 +133,14 @@ if [ "${OS_TYPE}" = "Linux" ]; then
   systemctl enable --now wg-quick@wg0
 
   # Firewall auf Linux
-  ufw default deny incoming
-  ufw default allow outgoing
-  ufw allow 22/tcp
-  ufw allow in on wg0
-  ufw --force enable
+  ufw default deny incoming 2>/dev/null || true
+  ufw default allow outgoing 2>/dev/null || true
+  ufw allow 22/tcp 2>/dev/null || true
+  ufw allow in on wg0 2>/dev/null || true
+  ufw --force enable 2>/dev/null || true
 
 elif [ "${OS_TYPE}" = "Darwin" ]; then
   echo "--> Starte WireGuard Tunnel auf macOS..."
-  # Falls wg0 bereits läuft, erst stoppen
   sudo wg-quick down wg0 2>/dev/null || true
   sudo wg-quick up wg0
 fi
@@ -155,3 +151,28 @@ echo " OS:            ${OS_TYPE}"
 echo " VPN IP:        ${ASSIGNED_IP}"
 echo " Config Pfad:   ${CONF_FILE}"
 echo "=================================================="
+echo ""
+
+# ---------------------------------------------------------
+# ALLE REGISTRIERTEN CLIENTS VOM SERVER ABFRAGEN
+# ---------------------------------------------------------
+
+echo "--> Hole Liste aller registrierten VPN-Clients..."
+CLIENTS_RESPONSE=$(curl -s -X GET "http://${SERVER_ENDPOINT}:${API_PORT}/clients" \
+  -H "X-API-Token: ${API_TOKEN}")
+
+if [ -n "${CLIENTS_RESPONSE}" ] && echo "${CLIENTS_RESPONSE}" | jq -e '.clients' >/dev/null 2>&1; then
+  echo "=================================================="
+  echo " REGISTRIERTE GERÄTE IM VPN"
+  echo "=================================================="
+  printf "%-12s | %-8s | %-24s | %s\n" "VPN IP" "STATUS" "ENDPOINT" "PUBLIC KEY"
+  echo "--------------------------------------------------------------------------------"
+  
+  echo "${CLIENTS_RESPONSE}" | jq -r '.clients[] | "\(.ip)\t\(if .is_online then "ONLINE" else "OFFLINE" end)\t\(.endpoint // "Keine Verbdg.")\t\(.pubkey)"' | \
+  while IFS=$'\t' read -r ip status endpoint pubkey; do
+    printf "%-12s | %-8s | %-24s | %s\n" "${ip}" "${status}" "${endpoint}" "${pubkey:0:15}..."
+  done
+  echo "=================================================="
+else
+  echo "(Konnte Client-Liste vom Server nicht abrufen)"
+fi
