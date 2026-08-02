@@ -1,4 +1,11 @@
 #!/bin/bash
+
+# Stellen sicher, dass WireGuard installiert ist
+if ! command -v wg &> /dev/null; then
+  echo "Installing WireGuard..."
+  apt-get update && apt-get install -y wireguard wireguard-tools
+fi
+
 # 1. Schlüsselpaar für den Server & den Mac generieren
 mkdir -p /etc/wireguard/keys
 chmod 700 /etc/wireguard/keys
