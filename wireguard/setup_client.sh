@@ -146,7 +146,7 @@ fi
 echo "--> Vom Server zugewiesene VPN-IP: ${ASSIGNED_IP}"
 
 # ---------------------------------------------------------
-# CONFIG SCHREIBEN & TUNNEL STARTEN
+# CONFIG SCHREIBEN & TUNNEL STARTEN (Ohne DNS-Verbiegung)
 # ---------------------------------------------------------
 
 CONF_FILE="${WG_DIR}/wg0.conf"
