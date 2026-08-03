@@ -70,15 +70,15 @@ fi
 
 if [ "${OS_TYPE}" = "Linux" ]; then
   if ! command -v wg &> /dev/null || ! command -v jq &> /dev/null; then
-    echo "--> Installiere WireGuard & Tools via apt..."
-    apt-get update -qq && apt-get install -y -qq wireguard wireguard-tools curl jq ufw || \
+    echo "--> Installiere wireguard-tools & jq via apt..."
+    apt-get update -qq && apt-get install -y -qq wireguard wireguard-tools curl jq ufw dnsutils || \
       error_exit "Paketinstallation über apt-get fehlgeschlagen." "Prüfe deine Internetverbindung auf dem Client."
   fi
   WG_DIR="/etc/wireguard"
 elif [ "${OS_TYPE}" = "Darwin" ]; then
-  if ! command -v wg &> /dev/null || ! command -v jq &> /dev/null; then
-    echo "--> Installiere wireguard-tools & jq via Homebrew..."
-    brew install wireguard-tools jq curl || \
+  if ! command -v wg &> /dev/null || ! command -v jq &> /dev/null || ! command -v dig &> /dev/null; then
+    echo "--> Installiere wireguard-tools, jq & dnsutils via Homebrew..."
+    brew install wireguard-tools jq curl bind || \
       error_exit "Homebrew-Installation fehlgeschlagen." "Stelle sicher, dass Homebrew auf deinem Mac installiert ist."
   fi
   BREW_PREFIX="$(brew --prefix)"
@@ -91,10 +91,10 @@ sudo mkdir -p "${KEY_DIR}"
 sudo chmod 700 "${KEY_DIR}"
 
 # ---------------------------------------------------------
-# KEY GENERIERUNG & REGISTRIERUNG
+# KEY GENERIERUNG ODER WIEDERVERWENDUNG (ROBUST & IDEMPOTENT)
 # ---------------------------------------------------------
 
-if [ ! -f "${KEY_DIR}/private.key" ]; then
+if ! sudo test -f "${KEY_DIR}/private.key"; then
   echo "--> Generiere einzigartiges Schlüsselpaar für diesen Client..."
   PRIV_KEY=$(wg genkey)
   PUB_KEY=$(echo "${PRIV_KEY}" | wg pubkey)
@@ -102,12 +102,14 @@ if [ ! -f "${KEY_DIR}/private.key" ]; then
   echo "${PRIV_KEY}" | sudo tee "${KEY_DIR}/private.key" > /dev/null
   echo "${PUB_KEY}" | sudo tee "${KEY_DIR}/public.key" > /dev/null
   sudo chmod 600 "${KEY_DIR}/private.key" "${KEY_DIR}/public.key"
+else
+  echo "--> Vorhandenes Schlüsselpaar gefunden (idempotenter Start)..."
 fi
 
 CLIENT_PRIV=$(sudo cat "${KEY_DIR}/private.key")
 CLIENT_PUB=$(sudo cat "${KEY_DIR}/public.key")
 
-echo "--> Registriere Client bei ${SERVER_ENDPOINT}:${API_PORT}..."
+echo "--> Registriere/Validiere Client bei ${SERVER_ENDPOINT}:${API_PORT}..."
 
 # HTTP Statuscode & Response getrennt auslesen, Timeout auf 5 Sekunden
 HTTP_STATUS=$(curl -s -o /tmp/wg_api_res.txt -w "%{http_code}" --connect-timeout 5 \
@@ -146,6 +148,17 @@ fi
 echo "--> Vom Server zugewiesene VPN-IP: ${ASSIGNED_IP}"
 
 # ---------------------------------------------------------
+# ENDPOINT IP ERMITTELN (Erzwinge IPv4 für Fritz!Box Portweiterleitung)
+# ---------------------------------------------------------
+
+RESOLVED_IPV4=$(dig +short A "${SERVER_ENDPOINT}" | head -n1)
+if [ -z "${RESOLVED_IPV4}" ]; then
+  # Fallback falls dig fehlschlägt
+  RESOLVED_IPV4="${SERVER_ENDPOINT}"
+fi
+echo "--> Verwende IPv4 Endpoint: ${RESOLVED_IPV4}:51820"
+
+# ---------------------------------------------------------
 # CONFIG SCHREIBEN & TUNNEL STARTEN (Ohne DNS-Verbiegung)
 # ---------------------------------------------------------
 
@@ -158,7 +171,7 @@ Address = ${ASSIGNED_IP}/32
 
 [Peer]
 PublicKey = ${SERVER_PUBKEY}
-Endpoint = ${SERVER_ENDPOINT}:51820
+Endpoint = ${RESOLVED_IPV4}:51820
 AllowedIPs = 10.8.0.0/24
 PersistentKeepalive = 25
 EOF
@@ -191,7 +204,7 @@ echo "=================================================="
 echo ""
 
 # ---------------------------------------------------------
-# ALLE REGISTRIERTEN CLIENTS VOM SERVER ABFRAGEN
+# PING-SWEEP & CLIENT-LISTE VOM SERVER ABFRAGEN
 # ---------------------------------------------------------
 
 echo "--> Hole Liste aller registrierten VPN-Clients..."
@@ -199,16 +212,28 @@ CLIENTS_RESPONSE=$(curl -s --connect-timeout 3 -X GET "http://${SERVER_ENDPOINT}
   -H "X-API-Token: ${API_TOKEN}" || echo "")
 
 if [ -n "${CLIENTS_RESPONSE}" ] && echo "${CLIENTS_RESPONSE}" | jq -e '.clients' >/dev/null 2>&1; then
+  echo "--> Führe Ping-Sweep im VPN-Netz aus, um Endpunkte zu aktivieren..."
+  while read -r target_ip; do
+    if [ -n "${target_ip}" ]; then
+      ping -c 1 -W 1 "${target_ip}" >/dev/null 2>&1 || true
+    fi
+  done < <(echo "${CLIENTS_RESPONSE}" | jq -r '.clients[].ip // empty')
+
+  # Erneut Clients abrufen
+  CLIENTS_RESPONSE=$(curl -s --connect-timeout 3 -X GET "http://${SERVER_ENDPOINT}:${API_PORT}/clients" \
+    -H "X-API-Token: ${API_TOKEN}" || echo "${CLIENTS_RESPONSE}")
+
   echo "=================================================="
   echo " REGISTRIERTE GERÄTE IM VPN"
   echo "=================================================="
   printf "%-12s | %-8s | %-24s | %s\n" "VPN IP" "STATUS" "ENDPOINT" "PUBLIC KEY"
   echo "--------------------------------------------------------------------------------"
   
-  echo "${CLIENTS_RESPONSE}" | jq -r '.clients[] | "\(.ip)\t\(if .is_online then "ONLINE" else "OFFLINE" end)\t\(.endpoint // "Keine Verbdg.")\t\(.pubkey)"' | \
   while IFS=$'\t' read -r ip status endpoint pubkey; do
-    printf "%-12s | %-8s | %-24s | %s\n" "${ip}" "${status}" "${endpoint}" "${pubkey:0:15}..."
-  done
+    if [ -n "${ip}" ]; then
+      printf "%-12s | %-8s | %-24s | %s\n" "${ip}" "${status}" "${endpoint}" "${pubkey:0:15}..."
+    fi
+  done < <(echo "${CLIENTS_RESPONSE}" | jq -r '.clients[]? | "\(.ip)\t\(if .is_online then "ONLINE" else "OFFLINE" end)\t\(.endpoint // "Keine Verbdg.")\t\(.pubkey)"')
   echo "=================================================="
 else
   echo "(Hinweis: Client-Liste konnte nach dem Verbinden nicht abgerufen werden)"
